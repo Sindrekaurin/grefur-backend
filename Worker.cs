@@ -100,6 +100,7 @@ public class Worker : BackgroundService
             _services.GetRequiredService<EventLoggerService>();
             _services.GetRequiredService<LoggerEngine>();
             _services.GetRequiredService<PredictionEngine>();
+            _services.GetRequiredService<ChangeCustomerDataEngine>();
         }
         catch (Exception ex)
         {

@@ -33,11 +33,9 @@ public class AlarmEngine :
         // Check subscription level using the Enum from the Customer object
         if (almEvt.AlarmPolicyLevel == AlarmLevel.None)
         {
-            _logger.LogInformation("[AlarmEngine]: Alarm analysis denied for customer {CustomerId}", almEvt.Customer.CustomerId);
+            _logger.LogDebug("[AlarmEngine]: Alarm analysis denied for customer {CustomerId}", almEvt.Customer.CustomerId);
             return;
         }
-
-        _logger.LogInformation("[AlarmEngine]: Enrichment received for Customer {CustomerId}", almEvt.Customer.CustomerId);
 
         // Logic for ML analysis or threshold checking would go here
         if (double.TryParse(almEvt.Value, out double numericValue))

@@ -3,10 +3,12 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using grefurBackend.Models;
-using Microsoft.Extensions.Logging;
+using grefurBackend.Context;
 using grefurBackend.Events.Domain;
 using grefurBackend.Infrastructure;
 using grefurBackend.Events.Queries;
+using Microsoft.Extensions.Logging;
+using Microsoft.EntityFrameworkCore;
 
 namespace grefurBackend.Services
 {
@@ -16,81 +18,143 @@ namespace grefurBackend.Services
     {
         private readonly ILogger<CustomerService> _logger;
         private readonly EventBus _eventBus;
+        private readonly MySqlContext _context;
 
-        public CustomerService(ILogger<CustomerService> logger, EventBus eventBus)
+        public CustomerService(ILogger<CustomerService> Logger, EventBus EventBus, MySqlContext Context)
         {
-            _logger = logger;
-            _eventBus = eventBus;
+            _logger = Logger;
+            _eventBus = EventBus;
+            _context = Context;
 
             _eventBus.Subscribe<CustomerQueryEvent>(this);
             _eventBus.Subscribe<RequestCustomerValueEnrichmentEvent>(this);
         }
 
-        public async Task Handle(CustomerQueryEvent evt)
+        public async Task<bool> CreateCustomer(GrefurCustomer Config)
         {
-            var customer = await GetCustomerByDeviceIdAsync(evt.DeviceId);
-            if (customer != null)
+            try
             {
-                // Vi bruker navngitte parametere som matcher konstruktøren i CustomerQuery.cs
-                var response = new CustomerQueryResponseEvent(
-                    deviceId: evt.DeviceId,
-                    customerIdParam: customer.CustomerId, // Endret fra customerId til customerIdParam
-                    source: nameof(CustomerService),
-                    correlationId: evt.CorrelationId // Sørg for at CustomerQueryEvent har CorrelationId (PascalCase)
-                );
-                await _eventBus.Publish(response);
+                await _context.GrefurCustomers.AddAsync(Config).ConfigureAwait(false);
+                await _context.SaveChangesAsync().ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception Ex)
+            {
+                _logger.LogError(Ex, "Error creating customer {CustomerId}", Config.CustomerId);
+                return false;
             }
         }
 
-        public async Task Handle(RequestCustomerValueEnrichmentEvent evt)
+        public async Task<bool> EditCustomer(GrefurCustomer Config)
         {
-            _logger.LogInformation("[CustomerService]: Received RequestCustomerValueEnrichmentEvent query");
-
-            _logger.LogInformation("[CustomerService]: Device: {deviceId}, Topic: {topic}, CorrelationId: {correlationId}",
-                evt.DeviceId, evt.Topic, evt.CorrelationId);
-
-            var customer = await GetCustomerByDeviceIdAsync(evt.DeviceId);
-
-            if (customer == null)
+            try
             {
-                // Note: evt.Customer.CustomerId used because evt.CustomerId string was removed
-                _logger.LogWarning("[CustomerService]: Could not find customer for device {deviceId} during enrichment.", evt.DeviceId);
+                var Existing = await _context.GrefurCustomers
+                    .FirstOrDefaultAsync(C => C.CustomerId == Config.CustomerId)
+                    .ConfigureAwait(false);
+
+                if (Existing == null) return false;
+
+                Existing.OrganizationName = Config.OrganizationName;
+                Existing.OrganizationNumber = Config.OrganizationNumber;
+                Existing.IsEnabled = Config.IsEnabled;
+                Existing.RegisteredDevices = Config.RegisteredDevices;
+                Existing.LogSubscription = Config.LogSubscription;
+                Existing.AlarmSubscription = Config.AlarmSubscription;
+                Existing.NotificationTypes = Config.NotificationTypes;
+
+                await _context.SaveChangesAsync().ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception Ex)
+            {
+                _logger.LogError(Ex, "Error editing customer {CustomerId}", Config.CustomerId);
+                return false;
+            }
+        }
+
+        public async Task<bool> DeleteCustomer(string CustomerId)
+        {
+            try
+            {
+                var Customer = await _context.GrefurCustomers
+                    .FirstOrDefaultAsync(C => C.CustomerId == CustomerId)
+                    .ConfigureAwait(false);
+
+                if (Customer == null) return false;
+
+                _context.GrefurCustomers.Remove(Customer);
+                await _context.SaveChangesAsync().ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception Ex)
+            {
+                _logger.LogError(Ex, "Error deleting customer {CustomerId}", CustomerId);
+                return false;
+            }
+        }
+
+        public async Task Handle(CustomerQueryEvent Evt)
+        {
+            var Customer = await GetCustomerByDeviceIdAsync(Evt.DeviceId).ConfigureAwait(false);
+            if (Customer != null)
+            {
+                var Response = new CustomerQueryResponseEvent(
+                    deviceId: Evt.DeviceId,
+                    customerIdParam: Customer.CustomerId,
+                    source: nameof(CustomerService),
+                    correlationId: Evt.CorrelationId
+                );
+                await _eventBus.Publish(Response).ConfigureAwait(false);
+            }
+        }
+
+        public async Task Handle(RequestCustomerValueEnrichmentEvent Evt)
+        {
+            _logger.LogDebug("[CustomerService]: Received RequestCustomerValueEnrichmentEvent - Event details: {@event}", Evt);
+
+            var Customer = await GetCustomerByDeviceIdAsync(Evt.DeviceId).ConfigureAwait(false);
+
+            if (Customer == null)
+            {
+                _logger.LogWarning("[CustomerService]: Could not find customer for device {DeviceId} during enrichment.", Evt.DeviceId);
                 return;
             }
 
-            int alarmLevelValue = (int)customer.AlarmSubscription;
-            int logLevelValue = (int)customer.LogSubscription;
+            int alarmLevelValue = (int)Customer.AlarmSubscription;
+            int logLevelValue = (int)Customer.LogSubscription;
 
-            _logger.LogDebug("[CustomerService]: Mapping subscriptions for {customerId} - Alarm: {alarmEnum} ({alarmInt}), Log: {logEnum} ({logInt})",
-                customer.CustomerId, customer.AlarmSubscription, alarmLevelValue, customer.LogSubscription, logLevelValue);
-
-            // Changed CustomerId: customer to Customer: customer to match the new constructor
-            var response = new ResponseCustomerValueEnrichmentEvent(
-                Customer: customer,
-                SubscriptionId: $"SUB-{customer.CustomerId}",
-                AlarmPolicyLevel: customer.AlarmSubscription,
-                LogPolicyLevel: customer.LogSubscription,
+            var Response = new ResponseCustomerValueEnrichmentEvent(
+                Customer: Customer,
+                SubscriptionId: $"SUB-{Customer.CustomerId}",
+                AlarmPolicyLevel: Customer.AlarmSubscription,
+                LogPolicyLevel: Customer.LogSubscription,
                 Source: nameof(CustomerService),
-                CorrelationId: evt.CorrelationId,
-                DeviceId: evt.DeviceId,
-                Topic: evt.Topic,
-                Value: evt.Value,
-                ValueType: evt.ValueType
+                CorrelationId: Evt.CorrelationId,
+                DeviceId: Evt.DeviceId,
+                Topic: Evt.Topic,
+                Value: Evt.Value,
+                ValueType: Evt.ValueType
             );
 
-            _logger.LogDebug("[CustomerService]: Publishing response to EventBus with CorrelationId: {correlationId}", evt.CorrelationId);
+            _logger.LogDebug("[CustomerService]: Publishing response to EventBus with CorrelationId: {CorrelationId}", Evt.CorrelationId);
 
-            await _eventBus.Publish(response).ConfigureAwait(false);
-
-            _logger.LogDebug("[CustomerService]: Successfully published levels for {customerId}. Log: {logLevel}, Alarm: {alarmLevel}",
-                customer.CustomerId, logLevelValue, alarmLevelValue);
+            try
+            {
+                await _eventBus.Publish(Response).ConfigureAwait(false);
+                _logger.LogDebug("[CustomerService]: Successfully published levels for {CustomerId}. Log: {LogLevel}, Alarm: {AlarmLevel}",
+                    Customer.CustomerId, logLevelValue, alarmLevelValue);
+            }
+            catch (Exception Ex)
+            {
+                _logger.LogError(Ex, "[CustomerService]: Error publishing enrichment response for customer {CustomerId}", Customer.CustomerId);
+            }
         }
 
         public async Task<List<GrefurCustomer>> GetAllActiveSubscribersAsync()
         {
             var AllCustomers = await GetAllCustomersMockAsync().ConfigureAwait(false);
 
-            // Using the dynamic method to check for any active subscription or notification type
             var ActiveCustomers = AllCustomers
                 .Where(C => C.IsActiveSubscriber())
                 .ToList();
@@ -111,57 +175,62 @@ namespace grefurBackend.Services
             return ActiveCustomers;
         }
 
-        public async Task<GrefurCustomer?> GetCustomerByIdAsync(string customerId)
+        public async Task<GrefurCustomer?> GetCustomerByIdAsync(string CustomerId)
         {
-            var customers = await GetAllCustomersMockAsync().ConfigureAwait(false);
-            var customer = customers.FirstOrDefault(c => c.CustomerId == customerId);
+            var Customers = await GetAllCustomersMockAsync().ConfigureAwait(false);
+            var Customer = Customers.FirstOrDefault(C => C.CustomerId == CustomerId);
 
-            if (customer == null)
+            if (Customer == null)
             {
-                _logger.LogWarning("Customer {customerId} not found.", customerId);
+                _logger.LogWarning("Customer {CustomerId} not found.", CustomerId);
             }
 
-            return customer;
+            return Customer;
         }
 
-        public async Task<GrefurCustomer?> GetCustomerByDeviceIdAsync(string deviceId)
+        public async Task<GrefurCustomer?> GetCustomerByDeviceIdAsync(string DeviceId)
         {
-            var customers = await GetAllCustomersMockAsync().ConfigureAwait(false);
-            var customer = customers.FirstOrDefault(c => c.RegisteredDevices.Contains(deviceId));
+            var Customers = await GetAllCustomersMockAsync().ConfigureAwait(false);
+            var Customer = Customers.FirstOrDefault(C => C.RegisteredDevices.Contains(DeviceId));
 
-            if (customer == null)
+            if (Customer == null)
             {
-                _logger.LogWarning("Device {deviceId} is not registered to any Grefur customer.", deviceId);
+                _logger.LogWarning("Device {DeviceId} is not registered to any Grefur customer.", DeviceId);
             }
 
-            return customer;
+            return Customer;
         }
 
-        private Task<List<GrefurCustomer>> GetAllCustomersMockAsync()
+        private async Task<List<GrefurCustomer>> GetAllCustomersMockAsync()
         {
-            return Task.FromResult(new List<GrefurCustomer>
+            return await _context.GrefurCustomers.ToListAsync().ConfigureAwait(false);
+        }
+
+        private List<GrefurCustomer> GenerateTestCustomers(int Count)
+        {
+            var CustomerList = new List<GrefurCustomer>();
+
+            for (int i = 1; i <= Count; i++)
             {
-                new GrefurCustomer
+                string CustomerId = $"CUST-{(i + 2):D3}";
+
+                var NewCustomer = new GrefurCustomer
                 {
-                    CustomerId = "CUST-001",
+                    CustomerId = CustomerId,
                     RegisteredDevices = new List<string>
                     {
-                        "Grefur_3461",
-                        "Grefur_235cfe"
+                        $"Grefur_{i}",
+                        $"Grefur_{i}"
                     },
                     LogSubscription = SubscriptionLevel.Normal,
                     AlarmSubscription = AlarmLevel.None,
                     NotificationTypes = NotificationTypes.None
-                },
-                new GrefurCustomer
-                {
-                    CustomerId = "CUST-002",
-                    RegisteredDevices = new List<string> { "Grefur_3462" },
-                    LogSubscription = SubscriptionLevel.None,
-                    AlarmSubscription = AlarmLevel.None,
-                    NotificationTypes = NotificationTypes.None
-                }
-            });
+                };
+
+                CustomerList.Add(NewCustomer);
+            }
+
+            return CustomerList;
         }
     }
 }

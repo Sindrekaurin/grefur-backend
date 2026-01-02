@@ -51,7 +51,7 @@ public class LoggerService : IEventHandler<LogPointEvent>
         if (!Directory.Exists(_databasePath))
         {
             Directory.CreateDirectory(_databasePath);
-            _logger.LogInformation("LoggerService: Created database directory at {path}", _databasePath);
+            _logger.LogDebug("LoggerService: Created database directory at {path}", _databasePath);
         }
 
         _eventBus = eventBus;
@@ -145,8 +145,20 @@ public class LoggerService : IEventHandler<LogPointEvent>
         // 4. Trace result
         if (resultStatus == LogPointStatus.Created)
         {
-            _logger.LogInformation("Telemetry successfully logged: {Topic} (ID: {CorrelationId})",
+            _logger.LogDebug("Telemetry successfully logged: {Topic} (ID: {CorrelationId})",
                 logPointEvt.Topic, logPointEvt.CorrelationId);
+        } else
+        {
+            _logger.LogError("Telemetry logging failed: {Topic} (ID: {CorrelationId}) with status {Status}",
+                logPointEvt.Topic, logPointEvt.CorrelationId, resultStatus);
+
+            _eventBus.Publish(new ErrorEvent(
+                    errorCode: "LOG_FAILED",
+                    level: ErrorLevel.ServiceBreach,
+                    message: $"Telemetry logging failed: {logPointEvt.Topic} with status {resultStatus}",
+                    source: nameof(LoggerService),
+                    correlationId: logPointEvt.CorrelationId
+                )).Wait();
         }
     }
 
@@ -173,7 +185,7 @@ public class LoggerService : IEventHandler<LogPointEvent>
         string csvFilePath = Path.Combine(_databasePath, $"{safeFileName}.csv");
 
         // Debug logging for comfirming path of truth
-        _logger.LogInformation("Searching for log file at: {Path}", csvFilePath);
+        _logger.LogDebug("Searching for log file at: {Path}", csvFilePath);
 
         if (!File.Exists(csvFilePath))
         {
@@ -181,7 +193,7 @@ public class LoggerService : IEventHandler<LogPointEvent>
             return result;
         } else
         {
-            _logger.LogInformation("Log file found for topic: {Topic}", topic);
+            _logger.LogDebug("Log file found for topic: {Topic}", topic);
         }
 
             try

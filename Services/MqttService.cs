@@ -43,6 +43,8 @@ public class MqttService
 
     public async Task Connect()
     {
+        var correlationId = Guid.NewGuid().ToString();
+
         try
         {
             _client = new MqttClient(
@@ -68,6 +70,7 @@ public class MqttService
 
                 string deviceId = parts[0];
                 string valueType = parts[^1];
+                
 
                 var integrationEvent = new MqttMessageReceivedEvent(
                     customerId: "unknown",
@@ -76,22 +79,34 @@ public class MqttService
                     rawPayload: messagePayload,
                     value: messagePayload,
                     source: nameof(MqttService),
-                    correlationId: Guid.NewGuid().ToString(),
+                    correlationId: correlationId,
                     topic: receivedTopic
                 );
 
                 await _eventBus.Publish(integrationEvent).ConfigureAwait(false);
                 OnMessageReceived?.Invoke(this, integrationEvent);
 
-                if (_settings.isDebug)
-                {
-                    _logger.LogInformation("[MQTT Service] Device: {deviceId} | Payload: {payload}", deviceId, messagePayload);
-                }
+                _logger.LogDebug("[MQTT Service] MqttMessageReceivedEvent published successfully: @{event}", integrationEvent);
             };
 
             _client.ConnectionClosed += (sender, e) =>
             {
                 _logger.LogWarning("Connection to MQTT broker lost.");
+                _eventBus.Publish(new BrokerConnectionEvent(
+                    BrokerStatus.Disconnected,
+                    _settings.broker,
+                    "Disconnected from MQTT broker",
+                    nameof(MqttService),
+                    Guid.NewGuid().ToString()
+                )).Wait();
+
+                _eventBus.Publish(new ErrorEvent(
+                    errorCode: "BROKER_CONNECTION_LOST",
+                    level: ErrorLevel.Critical,
+                    message: $"Lost connection to broker at {_settings.broker}:{_settings.port}",
+                    source: nameof(MqttService),
+                    correlationId: correlationId
+                )).Wait();
             };
 
             _client.Connect(_settings.clientId, _settings.username, _settings.password);
@@ -124,7 +139,7 @@ public class MqttService
 
                 if (reply.Status == System.Net.NetworkInformation.IPStatus.Success)
                 {
-                    _logger.LogInformation("[{Service}]: Diagnostic -> Server {Broker} is Online (Ping: {Time}ms), but MQTT broker refused connection.",
+                    _logger.LogError("[{Service}]: Diagnostic -> Server {Broker} is Online (Ping: {Time}ms), but MQTT broker refused connection.",
                         nameof(MqttService), _settings.broker, reply.RoundtripTime);
                 }
                 else

@@ -104,12 +104,15 @@ namespace grefurBackend.Infrastructure
                 if (Filter(Response))
                 {
                     Tcs.TrySetResult(Response);
-                    Unsubscribe(TempHandler);
+                    if (TempHandler != null)
+                    {
+                        Unsubscribe(TempHandler);
+                    }
                 }
                 await Task.CompletedTask;
             });
 
-            Subscribe(TempHandler);
+            if (TempHandler != null) Unsubscribe(TempHandler);
 
             await Publish(RequestEvent).ConfigureAwait(false);
 

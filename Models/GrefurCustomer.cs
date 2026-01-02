@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.ComponentModel.DataAnnotations;
 
 namespace grefurBackend.Models;
 
@@ -32,7 +33,15 @@ public record SubscriptionInfo(SubscriptionLevel Level, string Description);
 
 public class GrefurCustomer
 {
+    [Key]
     public string CustomerId { get; set; } = string.Empty;
+    public string OrganizationName { get; set; } = string.Empty;
+    public string OrganizationNumber { get; set; } = string.Empty;
+
+    // Status
+    public bool IsEnabled { get; set; } = true;
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
     public List<string> RegisteredDevices { get; set; } = new();
 
     // Default subscriptions

@@ -11,7 +11,7 @@ public class ScopedEventBus : EventBus
     private readonly ConcurrentDictionary<Type, List<object>> handlers = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> scopes = new();
 
-    public new void subscribe<TEvent>(IEventHandler<TEvent> handler) where TEvent : Event
+    public void subscribe<TEvent>(IEventHandler<TEvent> handler) where TEvent : Event
     {
         var eventType = typeof(TEvent);
 
@@ -25,7 +25,7 @@ public class ScopedEventBus : EventBus
             });
     }
 
-    public new async Task publish(Event domainEvent)
+    public async Task publish(Event domainEvent)
     {
         var scopeKey = extractScope(domainEvent);
         var semaphore = scopes.GetOrAdd(scopeKey, _ => new SemaphoreSlim(1, 1));

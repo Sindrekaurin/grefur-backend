@@ -27,7 +27,7 @@ public class SubscriptionEngine : IEventHandler<ValueReceivedEvent>
     {
         try
         {
-            _logger.LogInformation("ValueReceivedEvent triggered for device {DeviceId}", evt.DeviceId);
+            _logger.LogDebug("ValueReceivedEvent triggered - @{Event}", evt);
 
             // Using PascalCase for named arguments to match the class definition
             var customerSubLvlQuery = new RequestCustomerValueEnrichmentEvent(

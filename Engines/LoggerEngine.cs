@@ -28,7 +28,7 @@ public class LoggerEngine : IEventHandler<ResponseCustomerValueEnrichmentEvent>
         // Bruker PascalCase: LogPolicyLevel og CustomerId
         if (evt.LogPolicyLevel <= 0)
         {
-            _logger.LogInformation("[LoggerEngine]: Logging denied for customer {CustomerId}", evt.Customer.CustomerId);
+            _logger.LogDebug("[LoggerEngine]: Logging denied for customer {CustomerId}", evt.Customer.CustomerId);
             return;
         }
 

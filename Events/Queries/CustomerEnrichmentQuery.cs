@@ -10,7 +10,6 @@ public sealed class RequestCustomerValueEnrichmentEvent : Event
     public string Topic { get; }
     public string Value { get; }
     public string ValueType { get; }
-    public string CorrelationId { get; }
 
     public RequestCustomerValueEnrichmentEvent(
         string DeviceId,
@@ -35,7 +34,6 @@ public sealed class RequestCustomerValueEnrichmentEvent : Event
         this.Topic = Topic;
         this.Value = Value;
         this.ValueType = ValueType;
-        this.CorrelationId = CorrelationId;
     }
 }
 
@@ -49,7 +47,6 @@ public sealed class ResponseCustomerValueEnrichmentEvent : Event
     public string Topic { get; }
     public string Value { get; }
     public string ValueType { get; }
-    public string CorrelationId { get; }
 
     public ResponseCustomerValueEnrichmentEvent(
         GrefurCustomer Customer,
@@ -86,6 +83,5 @@ public sealed class ResponseCustomerValueEnrichmentEvent : Event
         this.Topic = Topic;
         this.Value = Value;
         this.ValueType = ValueType;
-        this.CorrelationId = CorrelationId;
     }
 }
