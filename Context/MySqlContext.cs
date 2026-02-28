@@ -4,8 +4,9 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Text.Json;
-using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using grefurBackend.Models.AlarmConfiguration;
 
 namespace grefurBackend.Context
 {
@@ -13,72 +14,106 @@ namespace grefurBackend.Context
     {
         private readonly ILogger<MySqlContext> _logger;
 
-        public MySqlContext(DbContextOptions<MySqlContext> Options, ILogger<MySqlContext> Logger) : base(Options)
+        public MySqlContext(DbContextOptions<MySqlContext> options, ILogger<MySqlContext> logger) : base(options)
         {
-            _logger = Logger;
-
-            Console.ForegroundColor = ConsoleColor.Magenta;
-            Console.WriteLine("[MySqlContext] Database Context Initialized");
-            Console.ResetColor();
+            _logger = logger;
+            _logger.LogDebug("[MySqlContext] Database Context Initialized");
         }
 
         public DbSet<GrefurCustomer> GrefurCustomers { get; set; }
+        public DbSet<GrefurUser> GrefurUsers { get; set; }
+        public DbSet<GrefurDevice> GrefurDevices { get; set; }
+        public DbSet<MlAlarmConfiguration> MlAlarmConfigurations { get; set; }
 
-        public override async Task<int> SaveChangesAsync(CancellationToken CancellationToken = default)
+        public DbSet<VirtualGrefurDevice> VirtualGrefurDevice { get; set; }
+        public DbSet<VirtualSensorValue> VirtualSensorValues { get; set; }
+
+        public override async Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
         {
             try
             {
-                Console.ForegroundColor = ConsoleColor.Magenta;
-                Console.WriteLine($"[MySqlContext] Initiating SaveChangesAsync at {DateTime.Now:HH:mm:ss}");
-                Console.ResetColor();
+                var callerInfo = GetCallerInfo();
+                _logger.LogDebug("[MySqlContext] SaveChangesAsync triggered by: {Caller} at {Time}", callerInfo, DateTime.Now.ToString("HH:mm:ss"));
 
-                var Result = await base.SaveChangesAsync(CancellationToken);
+                var result = await base.SaveChangesAsync(cancellationToken);
 
-                Console.ForegroundColor = ConsoleColor.Magenta;
-                Console.WriteLine($"[MySqlContext] Successfully persisted {Result} changes to MySQL");
-                Console.ResetColor();
-
-                return Result;
+                _logger.LogDebug("[MySqlContext] Persisted {Count} changes from {Caller}", result, callerInfo);
+                return result;
             }
-            catch (Exception Ex)
+            catch (Exception ex)
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[MySqlContext] CRITICAL ERROR: {Ex.Message}");
-                Console.ResetColor();
+                _logger.LogCritical(ex, "[MySqlContext] CRITICAL ERROR in SaveChangesAsync");
                 throw;
             }
         }
 
-        protected override void OnModelCreating(ModelBuilder ModelBuilder)
+        private string GetCallerInfo()
         {
-            base.OnModelCreating(ModelBuilder);
+            var stackTrace = new StackTrace();
+            var frames = stackTrace.GetFrames();
 
-            ModelBuilder.Entity<GrefurCustomer>()
-                .Property(C => C.RegisteredDevices)
-                .HasConversion(
-                    V => JsonSerializer.Serialize(V, (JsonSerializerOptions)null),
-                    V => JsonSerializer.Deserialize<List<string>>(V, (JsonSerializerOptions)null) ?? new List<string>()
-                );
+            // {Check if frames is null before accessing LINQ methods}
+            if (frames == null)
+            {
+                return "Unknown Source";
+            }
+
+            var callerFrame = frames.FirstOrDefault(f =>
+            {
+                var method = f.GetMethod();
+                var typeName = method?.DeclaringType?.FullName ?? "";
+                // {Filters out any class within the Context namespace to find the actual service/controller}
+                return typeName.StartsWith("grefurBackend") && !typeName.Contains(".Context.");
+            });
+
+            if (callerFrame != null)
+            {
+                var method = callerFrame.GetMethod();
+                // {Explicitly check for method and DeclaringType to satisfy the compiler}
+                if (method?.DeclaringType != null)
+                {
+                    return $"{method.DeclaringType.Name}.{method.Name}";
+                }
+            }
+
+            return "Unknown Source";
+        }
+
+        /* Summary of function: Configures the database schema and inheritance strategy for grefur devices */
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+            // {Configures TPH (Table-per-Hierarchy) inheritance for devices}
+            modelBuilder.Entity<GrefurDevice>()
+                .HasDiscriminator<string>("DeviceCategory")
+                .HasValue<GrefurDevice>("Physical")
+                .HasValue<VirtualGrefurDevice>("Virtual");
+
+            // {Optional: Ensures that the virtual sensor values are deleted if the device is removed}
+            modelBuilder.Entity<VirtualSensorValue>()
+                .HasOne<VirtualGrefurDevice>()
+                .WithMany(d => d.SensorValues)
+                .HasForeignKey(v => v.DeviceId)
+                .OnDelete(DeleteBehavior.Cascade);
         }
 
         public void TestConnection()
         {
             try
             {
-                Console.ForegroundColor = ConsoleColor.Magenta;
-                Console.WriteLine("[MySqlContext] Testing database connection...");
+                _logger.LogInformation("[MySqlContext] Testing database connection...");
 
-                Database.OpenConnection();
-                Database.CloseConnection();
+                if (!Database.CanConnect())
+                {
+                    throw new Exception("Cannot connect to MySQL database");
+                }
 
-                Console.WriteLine("[MySqlContext] Connection test successful");
-                Console.ResetColor();
+                _logger.LogInformation("[MySqlContext] Connection test successful");
             }
-            catch (Exception Ex)
+            catch (Exception ex)
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[MySqlContext] Connection test failed: {Ex.Message}");
-                Console.ResetColor();
+                _logger.LogCritical(ex, "[MySqlContext] Connection test failed");
             }
         }
     }

@@ -1,12 +1,14 @@
+using System.IO;
+
 namespace grefurBackend.Models.AlarmConfiguration;
 
 public interface MlModelRepository
 {
-    MlModelMetadata? getActiveModel(
+    MlModelMetadata? GetActiveModel(
         string customerId,
         string targetMeasurementId);
 
-    void saveModel(
+    void SaveModel(
         MlModelMetadata metadata,
         Stream modelStream);
 }

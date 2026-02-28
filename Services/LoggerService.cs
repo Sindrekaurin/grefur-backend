@@ -1,295 +1,357 @@
-/*
- * LoggerService.cs 
- */
-
 using System;
-using System.IO;
-using System.Text;
+using System.Globalization;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using Microsoft.EntityFrameworkCore;
 using grefurBackend.Events.Domain;
 using grefurBackend.Events;
 using grefurBackend.Infrastructure;
 using grefurBackend.Types;
-using System.Globalization;
-using System.Collections.Concurrent;
+using grefurBackend.Context;
+using grefurBackend.Models;
+using grefurBackend.Workers;
 
 namespace grefurBackend.Services;
 
-public class LoggerService : IEventHandler<LogPointEvent>
+/* Summary of class: High-performance telemetry service for grefur-sensor. 
+   Implements 150ms throttling and 1-minute batching with duplicate-safe recovery. */
+public class LoggerService : IEventHandler<LogPointEvent>, IDisposable
 {
+    private static readonly TimeSpan Tier1Interval = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan Tier2Interval = TimeSpan.FromHours(1);
+    private static readonly TimeSpan Tier3Interval = TimeSpan.FromHours(2);
+
+    private static readonly int Tier1DaysThreshold = 7;
+    private static readonly int Tier2DaysThreshold = 30;
+    private static readonly int Tier3DaysThreshold = 90;
+    private static readonly int Tier4DaysThreshold = 180;
+
     private readonly ILogger<LoggerService> _logger;
     private readonly EventBus _eventBus;
+    private readonly IDbContextFactory<TimescaleContext> _timescaleContext;
+    private readonly CustomerUsageCoordinator _usageCoordinator;
 
-    private readonly string _databasePath;
+   
+
+    // --- State Management ---
+    private readonly ConcurrentDictionary<string, DateTime> _lastLogTimes = new();
+    private ConcurrentBag<SensorReading> _readingBuffer = new();
+    private readonly System.Timers.Timer _flushTimer;
+    private readonly TimeSpan _minLogInterval = TimeSpan.FromMilliseconds(150);
+
     private int _successCount = 0;
     private int _errorCount = 0;
-
-    private string _lastCorrelationId = string.Empty;
     private readonly object _syncLock = new object();
+    private DateTime _lastUsedTimestamp = DateTime.MinValue;
+    private readonly ConcurrentDictionary<(long Ticks, string Topic, string CustomerId), byte> _currentBatchKeys = new();
 
-    public LoggerService(ILogger<LoggerService> logger, EventBus eventBus)
+
+
+    public LoggerService(
+        ILogger<LoggerService> logger,
+        EventBus eventBus,
+        IDbContextFactory<TimescaleContext> timescaleContext,
+        CustomerUsageCoordinator usageCoordinator,
+        IHostApplicationLifetime appLifetime)
     {
         _logger = logger;
-
-        // Finn rotmappen til prosjektet mer robust
-        string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-
-        // Sjekk om vi kjører i utviklingsmodus (bin/Debug...) eller publisert modus
-        if (baseDir.Contains(Path.Combine("bin", "Debug")) || baseDir.Contains(Path.Combine("bin", "Release")))
-        {
-            // Gå opp 4 nivåer hvis vi er i bin/Debug/net9.0/
-            _databasePath = Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "DATABASE"));
-        }
-        else
-        {
-            // Hvis publisert, anta at DATABASE ligger i samme mappe som .dll
-            _databasePath = Path.Combine(baseDir, "DATABASE");
-        }
-
-        if (!Directory.Exists(_databasePath))
-        {
-            Directory.CreateDirectory(_databasePath);
-            _logger.LogDebug("LoggerService: Created database directory at {path}", _databasePath);
-        }
-
         _eventBus = eventBus;
+        _timescaleContext = timescaleContext;
+        _usageCoordinator = usageCoordinator;
 
-        // Subscribe to log point event
+        // Register applicaton to flush batch to database while stop signal is given
+        appLifetime.ApplicationStopping.Register(() =>
+        {
+            _logger.LogInformation("[LoggerService] Application stopping. Performing final flush...");
+            FlushBatchToDatabaseAsync().GetAwaiter().GetResult();
+        });
+
+        // Start batch timer: 1 minute (60000ms)
+        _flushTimer = new System.Timers.Timer(60000);
+        _flushTimer.Elapsed += async (s, e) => await FlushBatchToDatabaseAsync();
+        _flushTimer.AutoReset = true;
+        _flushTimer.Enabled = true;
+
         _eventBus.Subscribe<LogPointEvent>(this);
     }
 
-    // Public API used by LoggingEngine
-    // Add this to your class fields to track state
-    private readonly ConcurrentDictionary<string, (string Timestamp, string Payload)> _lastLogEntries = new();
-
-    public async Task<LogPointStatus> logTelemetryAsync(string topic, string payload, string correlationId)
+    /* Summary of function: Validates and throttles telemetry. 
+       Uses a thread-safe dictionary to guarantee no duplicates enter the buffer. */
+    public async Task<LogPointStatus> logTelemetryAsync(string topic, string payload, string correlationId, string customerId = "default")
     {
-        if (string.IsNullOrWhiteSpace(payload) || (!topic.EndsWith("/value") && !topic.EndsWith("/unit")))
+        if (string.IsNullOrWhiteSpace(payload) || topic.Contains("//") || (!topic.EndsWith("/value") && !topic.EndsWith("/unit")))
         {
             return LogPointStatus.Received;
         }
 
-        string currentTimestamp = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
-
-        lock (_syncLock)
+        // 1. Throttling per topic (150ms)
+        DateTime now = DateTime.UtcNow;
+        if (_lastLogTimes.TryGetValue(topic, out var lastTime))
         {
-            // 1. Standard MQTT Correlation Check
-            if (_lastCorrelationId == correlationId) return LogPointStatus.Received;
-            _lastCorrelationId = correlationId;
-
-            // 2. Time-Based Throttle Guard
-            // If the same topic has the same payload within the same second, ignore it.
-            if (_lastLogEntries.TryGetValue(topic, out var lastEntry))
-            {
-                if (lastEntry.Timestamp == currentTimestamp && lastEntry.Payload == payload)
-                {
-                    return LogPointStatus.Received; // Exact duplicate within the same second
-                }
-            }
-
-            // Update the cache with the current entry
-            _lastLogEntries[topic] = (currentTimestamp, payload);
+            if (now - lastTime < _minLogInterval) return LogPointStatus.Received;
         }
+        _lastLogTimes[topic] = now;
 
         try
         {
-            string safeFileName = topic.Replace("/", "_").Replace("\\", "_");
-            string logLine = $"{currentTimestamp};{payload}{Environment.NewLine}";
+            if (!double.TryParse(payload, NumberStyles.Any, CultureInfo.InvariantCulture, out var numericValue))
+            {
+                return LogPointStatus.Received;
+            }
 
-            string logFilePath = Path.Combine(_databasePath, $"{safeFileName}.log");
-            string csvFilePath = Path.Combine(_databasePath, $"{safeFileName}.csv");
+            var segments = topic.Split('/');
+            if (segments.Length < 2) return LogPointStatus.Received;
 
-            // Concurrent write to both log and csv
-            await Task.WhenAll(
-                File.AppendAllTextAsync(logFilePath, logLine),
-                File.AppendAllTextAsync(csvFilePath, logLine)
-            ).ConfigureAwait(false);
+            string deviceId = segments[0];
+            string property = segments.Last();
+            DateTime timestampToUse;
 
-            Interlocked.Increment(ref _successCount);
+            // 2. Generer unikt tidsstempel og sjekk mot nåværende batch
+            lock (_syncLock)
+            {
+                timestampToUse = DateTime.UtcNow;
+                // Hvis vi får inn meldinger ekstremt fort, skyver vi tidsstempelet litt
+                if (timestampToUse <= _lastUsedTimestamp)
+                {
+                    timestampToUse = _lastUsedTimestamp.AddTicks(1);
+                }
+                _lastUsedTimestamp = timestampToUse;
+            }
+
+            // 3. ATOMISK SJEKK: Prøv å legge til nøkkelen i "vaskefatet"
+            // Hvis TryAdd feiler, betyr det at nøyaktig denne målingen allerede er i køen
+            var key = (timestampToUse.Ticks, deviceId, property);
+            if (!_currentBatchKeys.TryAdd(key, 0))
+            {
+                return LogPointStatus.Received;
+            }
+
+            var reading = new SensorReading
+            {
+                Timestamp = timestampToUse,
+                Topic = topic,
+                CustomerId = customerId,
+                DeviceId = deviceId,
+                Property = property,
+                Value = numericValue
+            };
+
+            _readingBuffer.Add(reading);
+
+            if (customerId != "default")
+            {
+                _usageCoordinator.BufferCustomerLogPointForUsage(customerId);
+            }
+
             return LogPointStatus.Created;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "LoggerService: Failed to log topic {topic}", topic);
+            _logger.LogError(ex, "LoggerService: Error buffering {Topic}", topic);
             return LogPointStatus.Failed;
         }
     }
 
-    // Keep existing event handler but delegate to logTelemetryAsync
-    public async Task Handle(LogPointEvent logPointEvt)
+    /* Summary of function: Flushes the buffer and clears the key-registry. */
+    private async Task FlushBatchToDatabaseAsync()
     {
-        // 1. Quick exit: Only process if status is Requested/Received and value exists
-        if (logPointEvt.Status != LogPointStatus.Requested && logPointEvt.Status != LogPointStatus.Received)
+        if (_readingBuffer.IsEmpty) return;
+
+        var itemsToSave = Interlocked.Exchange(ref _readingBuffer, new ConcurrentBag<SensorReading>()).ToList();
+        _currentBatchKeys.Clear();
+
+        if (itemsToSave.Count == 0) return;
+
+        try
         {
-            return;
+            // Sikker batch-størrelse - godt under 10922
+            const int batchSize = 4000;
+            int totalSaved = 0;
+
+            for (int i = 0; i < itemsToSave.Count; i += batchSize)
+            {
+                var batch = itemsToSave.Skip(i).Take(batchSize).ToList();
+
+                // Bruk ny context for hver batch
+                using var context = await _timescaleContext.CreateDbContextAsync();
+                context.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
+
+                await context.SensorReadings.AddRangeAsync(batch);
+                await context.SaveChangesAsync();
+
+                totalSaved += batch.Count;
+
+                _logger.LogDebug("Saved batch {BatchNumber}: {Count} readings",
+                    i / batchSize + 1, batch.Count);
+            }
+
+            Interlocked.Add(ref _successCount, totalSaved);
+            _logger.LogInformation("Successfully saved all {Count} sensor readings in batches of {BatchSize}",
+                itemsToSave.Count, batchSize);
         }
-
-        if (string.IsNullOrWhiteSpace(logPointEvt.Value))
+        catch (Exception ex)
         {
-            return;
-        }
-
-        // 2. Structured logging (Using PascalCase CorrelationId)
-        _logger.LogDebug("Processing telemetry logging for Topic: {Topic}, CorrelationId: {CorrelationId}",
-            logPointEvt.Topic, logPointEvt.CorrelationId);
-
-        // 3. Execute logging with the de-bouncer logic
-        LogPointStatus resultStatus = await logTelemetryAsync(
-            logPointEvt.Topic,
-            logPointEvt.Value,
-            logPointEvt.CorrelationId
-        ).ConfigureAwait(false);
-
-        // 4. Trace result
-        if (resultStatus == LogPointStatus.Created)
-        {
-            _logger.LogDebug("Telemetry successfully logged: {Topic} (ID: {CorrelationId})",
-                logPointEvt.Topic, logPointEvt.CorrelationId);
-        } else
-        {
-            _logger.LogError("Telemetry logging failed: {Topic} (ID: {CorrelationId}) with status {Status}",
-                logPointEvt.Topic, logPointEvt.CorrelationId, resultStatus);
-
-            _eventBus.Publish(new ErrorEvent(
-                    errorCode: "LOG_FAILED",
-                    level: ErrorLevel.ServiceBreach,
-                    message: $"Telemetry logging failed: {logPointEvt.Topic} with status {resultStatus}",
-                    source: nameof(LoggerService),
-                    correlationId: logPointEvt.CorrelationId
-                )).Wait();
+            _logger.LogError(ex, "Batch save failed with {Count} items, falling back to individual saves",
+                itemsToSave.Count);
+            await SavePointsIndividuallyAsync(itemsToSave);
         }
     }
 
-    public async Task<IReadOnlyList<LogPoint>> getLogAsync(
-        string topic,
-        DateTime startDateTime,
-        DateTime endDateTime,
-        CancellationToken cancellationToken = default)
+    /* Summary of function: Fallback save. Swallows DbUpdateException to keep logs clean. */
+    private async Task SavePointsIndividuallyAsync(List<SensorReading> items)
     {
-        var result = new List<LogPoint>();
+        int localSaved = 0;
+        const int batchSize = 2000; // Mindre batcher for fallback
 
-        // TODO: TimescaleDB
-        // Denne metoden er per i dag filbasert.
-        // Ved overgang til TimescaleDB skal hele blokken fra filoppslag til parsing
-        // erstattes av én SQL-spørring:
-        //
-        // SELECT time, value
-        // FROM measurements
-        // WHERE measurement_id = @topic
-        //   AND time BETWEEN @startDateTime AND @endDateTime
-        // ORDER BY time ASC;
-
-        string safeFileName = topic.Replace("/", "_").Replace("\\", "_");
-        string csvFilePath = Path.Combine(_databasePath, $"{safeFileName}.csv");
-
-        // Debug logging for comfirming path of truth
-        _logger.LogDebug("Searching for log file at: {Path}", csvFilePath);
-
-        if (!File.Exists(csvFilePath))
+        for (int i = 0; i < items.Count; i += batchSize)
         {
-            _logger.LogWarning("Log file not found for topic: {Topic}", topic);
-            return result;
-        } else
-        {
-            _logger.LogDebug("Log file found for topic: {Topic}", topic);
-        }
+            var batch = items.Skip(i).Take(batchSize).ToList();
 
             try
             {
-                using var stream = new FileStream(
-                csvFilePath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite);
+                using var context = await _timescaleContext.CreateDbContextAsync();
+                context.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
 
-                using var reader = new StreamReader(stream, Encoding.UTF8);
-
-                while (!reader.EndOfStream)
+                await context.SensorReadings.AddRangeAsync(batch);
+                await context.SaveChangesAsync();
+                localSaved += batch.Count;
+            }
+            catch (DbUpdateException)
+            {
+                // Hvis batch feiler pga duplikater, prøv én og én
+                foreach (var item in batch)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    var line = await reader.ReadLineAsync().ConfigureAwait(false);
-                    if (string.IsNullOrWhiteSpace(line))
-                        continue;
-
-                    // TODO: TimescaleDB
-                    // Parsing av CSV-linje tilsvarer mapping av SQL-resultat (time, value)
-                    // Denne delen forsvinner helt når data hentes direkte fra database.
-
-                    var parts = line.Split(';', StringSplitOptions.RemoveEmptyEntries);
-
-                    if (parts.Length < 2)
-                        continue;
-
-                    if (!DateTime.TryParse(parts[0], out var timestamp))
-                        continue;
-
-                    if (timestamp < startDateTime || timestamp > endDateTime)
-                        continue;
-
-                    if (!double.TryParse(parts[1], NumberStyles.Any, CultureInfo.InvariantCulture, out var value))
-                        continue;
-
-                result.Add(new LogPoint(timestamp, value));
+                    try
+                    {
+                        using var context = await _timescaleContext.CreateDbContextAsync();
+                        context.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
+                        context.SensorReadings.Add(item);
+                        await context.SaveChangesAsync();
+                        localSaved++;
+                    }
+                    catch (DbUpdateException)
+                    {
+                        // Ignorer duplikater - de finnes allerede i databasen
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Individual save error for {Topic}", item.Topic);
+                    }
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "LoggerService: Error reading log file {path}", csvFilePath);
+                _logger.LogError(ex, "Batch save error for {Count} items", batch.Count);
             }
-        return result;
+        }
+
+        Interlocked.Add(ref _successCount, localSaved);
+        if (localSaved < items.Count)
+        {
+            _logger.LogWarning("Saved {Saved}/{Total} readings individually", localSaved, items.Count);
+        }
     }
 
-    public async Task<bool> saveToFile(string fileName, string payload)
+    public async Task Handle(LogPointEvent logPointEvt)
     {
-        try
-        {
-            // Sørg for at vi har en ren sti og kombiner med database-mappen
-            string filePath = Path.Combine(_databasePath, fileName);
+        if (logPointEvt.Status != LogPointStatus.Requested && logPointEvt.Status != LogPointStatus.Received) return;
+        await logTelemetryAsync(logPointEvt.Topic, logPointEvt.Value, logPointEvt.CorrelationId, logPointEvt.CustomerId);
+    }
 
-            // Sjekk om mappen eksisterer (sikkerhetskopi)
-            if (!Directory.Exists(_databasePath))
+    // --- Maintenance & Queries ---
+
+    public async Task<IReadOnlyList<LogPoint>> GetLogAsync(string topic, DateTime start, DateTime end, CancellationToken ct = default)
+    {
+        using var context = await _timescaleContext.CreateDbContextAsync(ct);
+        var seg = topic.Split('/');
+        return await context.SensorReadings.AsNoTracking()
+            .Where(r => r.DeviceId == seg[0] && r.Property == seg.Last() && r.Timestamp >= start && r.Timestamp <= end)
+            .OrderBy(r => r.Timestamp).Select(r => new LogPoint(r.Timestamp, r.Value)).ToListAsync(ct);
+    }
+
+    /* Summary of function: Retrieves the last N readings for a specific device. 
+       Uses AsNoTracking for high performance. */
+    public async Task<List<SensorReading>> getLatestLogsAsync(string deviceId, int limit = 10)
+    {
+        using var context = await _timescaleContext.CreateDbContextAsync();
+        return await context.SensorReadings
+            .AsNoTracking()
+            .Where(r => r.DeviceId == deviceId)
+            .OrderByDescending(r => r.Timestamp)
+            .Take(limit)
+            .ToListAsync();
+    }
+
+
+    public async Task RunMaintenanceSmoothingAsync(CancellationToken ct = default)
+    {
+        using var context = await _timescaleContext.CreateDbContextAsync(ct);
+        DateTime now = DateTime.UtcNow;
+        await DownsampleRangeAsync(context, now.AddDays(-30), now.AddDays(-7), Tier1Interval, ct);
+        await DownsampleRangeAsync(context, now.AddDays(-90), now.AddDays(-30), Tier2Interval, ct);
+        await DownsampleRangeAsync(context, now.AddDays(-180), now.AddDays(-90), Tier3Interval, ct);
+    }
+
+    private async Task DownsampleRangeAsync(TimescaleContext context, DateTime start, DateTime end, TimeSpan interval, CancellationToken ct)
+    {
+        var streams = await context.SensorReadings.AsNoTracking()
+            .Where(r => r.Timestamp >= start && r.Timestamp < end)
+            .Select(r => new { r.Topic, r.DeviceId, r.Property, r.CustomerId })
+            .Distinct().ToListAsync(ct);
+
+        foreach (var s in streams)
+        {
+            var raw = await context.SensorReadings
+                .Where(r => r.Topic == s.Topic && r.Timestamp >= start && r.Timestamp < end)
+                .OrderBy(r => r.Timestamp).ToListAsync(ct);
+
+            if (raw.Count <= 1) continue;
+
+            var smoothed = raw.GroupBy(r => (r.Timestamp.Ticks / interval.Ticks) * interval.Ticks)
+                .Select(g => new SensorReading
+                {
+                    Timestamp = new DateTime(g.Key).AddTicks(interval.Ticks / 2),
+                    Value = g.Average(x => x.Value),
+                    Topic = s.Topic,
+                    DeviceId = s.DeviceId,
+                    Property = s.Property,
+                    CustomerId = s.CustomerId
+                }).ToList();
+
+            using var tx = await context.Database.BeginTransactionAsync(ct);
+            try
             {
-                Directory.CreateDirectory(_databasePath);
+                context.SensorReadings.RemoveRange(raw);
+                await context.SaveChangesAsync(ct);
+                context.SensorReadings.AddRange(smoothed);
+                await context.SaveChangesAsync(ct);
+                await tx.CommitAsync(ct);
             }
-
-            await File.AppendAllTextAsync(filePath, payload).ConfigureAwait(false);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "LoggerService: Failed to save to file {fileName}", fileName);
-            return false;
+            catch { await tx.RollbackAsync(ct); }
         }
     }
 
-    public async Task<bool> saveBinaryFileAsync(string fileName, byte[] data)
+    public async Task<int> UpdateTopicNameAsync(string customerId, string oldTopic, string newTopic, CancellationToken ct = default)
     {
-        try
-        {
-            string filePath = Path.Combine(_databasePath, fileName);
-            await File.WriteAllBytesAsync(filePath, data).ConfigureAwait(false);
-
-            _logger.LogInformation("LoggerService: Binary file saved to {Path}", filePath);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "LoggerService: Failed to save binary file {FileName}", fileName);
-            return false;
-        }
+        using var context = await _timescaleContext.CreateDbContextAsync(ct);
+        var seg = newTopic.Split('/');
+        return await context.SensorReadings
+            .Where(r => r.CustomerId == customerId && r.Topic == oldTopic)
+            .ExecuteUpdateAsync(s => s.SetProperty(r => r.Topic, newTopic).SetProperty(r => r.DeviceId, seg[0]).SetProperty(r => r.Property, seg.Last()), ct);
     }
 
-    public (int success, int error) getStatistics()
-    {
-        return (_successCount, _errorCount);
-    }
+    public (int success, int error) getStatistics() => (_successCount, _errorCount);
+    public void resetStatistics() { Interlocked.Exchange(ref _successCount, 0); Interlocked.Exchange(ref _errorCount, 0); }
 
-    public void resetStatistics()
+    /* Summary of function: Standard cleanup of resources. 
+   Final data flush is now handled by ApplicationStopping hook. */
+    public void Dispose()
     {
-        Interlocked.Exchange(ref _successCount, 0);
-        Interlocked.Exchange(ref _errorCount, 0);
+        _flushTimer?.Stop();
+        _flushTimer?.Dispose();
     }
 }

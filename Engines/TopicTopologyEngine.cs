@@ -10,12 +10,15 @@ using Microsoft.Extensions.Logging;
 using grefurBackend.Events.Queries;
 using grefurBackend.Services;
 using grefurBackend.Models;
+using grefurBackend.Events.Device;
+using grefurBackend.Helpers;
 
 namespace grefurBackend.Engines;
 
 public class TopicTopologyEngine : 
     IEventHandler<DeviceRegisteredEvent>,
-    IEventHandler<MqttMessageReceivedEvent>
+    IEventHandler<MqttMessageReceivedEvent>,
+    IEventHandler<UnknownValueEvent>
 {
     private readonly EventBus _eventBus;
     private readonly MqttService _mqttService;
@@ -54,13 +57,16 @@ public class TopicTopologyEngine :
 
         _eventBus.Subscribe<DeviceRegisteredEvent>(this);
         _eventBus.Subscribe<MqttMessageReceivedEvent>(this);
+        _eventBus.Subscribe<UnknownValueEvent>(this);
+        
     }
 
     public async Task Handle(DeviceRegisteredEvent evt)
     {
         _logger.LogInformation("[TopicTopologyEngine]: DeviceRegisteredEvent received: {DeviceId}", evt.DeviceId);
 
-        var baseTopic = $"{evt.DeviceId}/info/baseTopic";
+        var baseTopic = TopicHelper.ConstructTopic(evt.DeviceId, "info/baseTopic");
+
         if (_mqttService.IsConnected)
         {
             _mqttService.Subscribe(baseTopic);
@@ -79,26 +85,82 @@ public class TopicTopologyEngine :
         await _eventBus.Publish(topicBoundEvent).ConfigureAwait(false);
     }
 
-    /*public async Task<string?> queryCustomerIdAsync(string deviceId)
+    public async Task Handle(UnknownValueEvent Evt)
     {
-        var queryEvent = new CustomerQueryEvent(
-            deviceId: deviceId,
-            source: nameof(TopicTopologyEngine),
-            correlationId: Guid.NewGuid().ToString()
-        );
+        try
+        {
+            if (string.IsNullOrEmpty(Evt.Topic)) return;
 
-        var response = await _eventBus.RequestAsync<CustomerQueryEvent, CustomerQueryResponseEvent>(
-            queryEvent,
-            r => r.DeviceId == deviceId
-            //timeoutMs: 5000
-        );
+            string deviceId = Evt.Topic.Split('/')[0];
+            string baseTopicFound = "unknown";
 
-        return response?.CustomerId;
-    }*/
+            if (_mqttService.IsConnected)
+            {
+                _mqttService.Unsubscribe(Evt.Topic);
+
+                // Forsøker å hente og fjerne basetopic fra cache
+                if (_deviceBaseTopics.TryRemove(deviceId, out var baseTopic))
+                {
+                    baseTopicFound = baseTopic;
+                    var fullSensorPattern = TopicHelper.GetDeviceWildcard(deviceId, baseTopicFound);
+                    _mqttService.Unsubscribe(fullSensorPattern);
+
+                    _logger.LogDebug("[TopicTopologyEngine]: Unsubscribed from baseTopic pattern: {Pattern}", fullSensorPattern);
+                }
+
+                // Fullstendig purging av enheten
+                _mqttService.Unsubscribe($"{deviceId}/#");
+                _mqttService.Unsubscribe($"{deviceId}/info/baseTopic");
+
+                _logger.LogDebug("[TopicTopologyEngine]: Fully purged MQTT subscriptions for device {DeviceId}", deviceId);
+
+                var removedEvent = new TopicBoundRemovedEvent(
+                    customerId: "unknown", // UnknownValueEvent har ikke kunde-info
+                    deviceId: deviceId,
+                    baseTopic: baseTopicFound,
+                    status: TopicBoundStatus.Success,
+                    source: nameof(TopicTopologyEngine),
+                    correlationId: Evt.CorrelationId,
+                    statusMessage: "Successfully cleaned up topology after unknown value detection"
+                );
+
+                await _eventBus.Publish(removedEvent).ConfigureAwait(false);
+            }
+            else
+            {
+                _logger.LogWarning("[TopicTopologyEngine]: Broker offline, could not unsubscribe from {Topic}", Evt.Topic);
+
+                var errorEvent = new ErrorEvent(
+                    errorCode: "TOPOLOGY_CLEANUP_OFFLINE",
+                    level: ErrorLevel.Critical,
+                    message: $"Failed to cleanup MQTT topology for device {deviceId} - Broker offline",
+                    source: nameof(TopicTopologyEngine),
+                    correlationId: Evt.CorrelationId,
+                    exceptionDetails: "MqttService.IsConnected was false during cleanup"
+                );
+
+                await _eventBus.Publish(errorEvent).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[TopicTopologyEngine]: Error handling UnknownValueEvent for topic {Topic}", Evt.Topic);
+
+            var errorEvent = new ErrorEvent(
+                errorCode: "TOPOLOGY_CLEANUP_ERROR",
+                level: ErrorLevel.Critical,
+                message: "Internal error during topology cleanup",
+                source: nameof(TopicTopologyEngine),
+                correlationId: Evt.CorrelationId,
+                exceptionDetails: ex.ToString()
+            );
+
+            await _eventBus.Publish(errorEvent).ConfigureAwait(false);
+        }
+    }
 
     public async Task Handle(MqttMessageReceivedEvent e)
     {
-        
         try
         {
             // Bruker PascalCase properties fra MqttMessageReceivedEvent
@@ -113,8 +175,10 @@ public class TopicTopologyEngine :
             var isInformationalMessage = _avoidTopicPrefixes.Keys.Any(prefix => eventTopic.StartsWith(prefix)) ||
                                             _avoidTopicSuffixes.Keys.Any(suffix => eventTopic.EndsWith(suffix));
 
+
             if (!isInformationalMessage)
             {
+
                 try
                 {
                     // Bruker PascalCase i konstruktøren til ValueReceivedEvent
@@ -144,7 +208,7 @@ public class TopicTopologyEngine :
                     _logger.LogInformation("[TopicTopologyEngine]: BaseTopic for {DeviceId} registered as {BaseTopic}",
                         eventDeviceId, payloadString);
 
-                    var sensorTopicPattern = $"{eventDeviceId}/{payloadString}/#";
+                    var sensorTopicPattern = TopicHelper.GetDeviceWildcard(eventDeviceId, payloadString);
 
                     // Antar at MqttService har PascalCase på IsConnected/IsConnected basert på din stil
                     if (_mqttService.IsConnected)

@@ -42,7 +42,7 @@ public sealed class ResponseCustomerValueEnrichmentEvent : Event
     public GrefurCustomer Customer { get; }
     public string SubscriptionId { get; }
     public AlarmLevel AlarmPolicyLevel { get; }
-    public SubscriptionLevel LogPolicyLevel { get; }
+    public LogSubscriptionLevel LogPolicyLevel { get; }
     public string DeviceId { get; }
     public string Topic { get; }
     public string Value { get; }
@@ -52,7 +52,7 @@ public sealed class ResponseCustomerValueEnrichmentEvent : Event
         GrefurCustomer Customer,
         string SubscriptionId,
         AlarmLevel AlarmPolicyLevel,
-        SubscriptionLevel LogPolicyLevel,
+        LogSubscriptionLevel LogPolicyLevel,
         string DeviceId,
         string Topic,
         string Value,

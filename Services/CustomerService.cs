@@ -7,128 +7,277 @@ using grefurBackend.Context;
 using grefurBackend.Events.Domain;
 using grefurBackend.Infrastructure;
 using grefurBackend.Events.Queries;
+using grefurBackend.Events;
 using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore;
+using grefurBackend.Events.Lifecycle;
+using Microsoft.AspNetCore.Identity;
 
 namespace grefurBackend.Services
 {
     public class CustomerService :
         IEventHandler<CustomerQueryEvent>,
-        IEventHandler<RequestCustomerValueEnrichmentEvent>
+        IEventHandler<RequestCustomerValueEnrichmentEvent>,
+        IEventHandler<SystemReadyEvent>
     {
         private readonly ILogger<CustomerService> _logger;
         private readonly EventBus _eventBus;
-        private readonly MySqlContext _context;
+        private readonly IDbContextFactory<MySqlContext> _mySqlContextFactory;
+        private readonly PasswordHasher<GrefurCustomer> _passwordHasher = new();
+        private readonly UserService _userService;
 
-        public CustomerService(ILogger<CustomerService> Logger, EventBus EventBus, MySqlContext Context)
+        public CustomerService(
+            ILogger<CustomerService> Logger,
+            EventBus EventBus,
+            IDbContextFactory<MySqlContext> MySqlContextFactory,
+            UserService UserService
+            )
         {
             _logger = Logger;
             _eventBus = EventBus;
-            _context = Context;
+            _mySqlContextFactory = MySqlContextFactory;
+            _userService = UserService;
 
             _eventBus.Subscribe<CustomerQueryEvent>(this);
             _eventBus.Subscribe<RequestCustomerValueEnrichmentEvent>(this);
+            _eventBus.Subscribe<SystemReadyEvent>(this);
+
         }
 
-        public async Task<bool> CreateCustomer(GrefurCustomer Config)
+
+
+        public async Task<bool> CreateCustomerAsync(GrefurCustomer customer)
+        {
+            using var context = await _mySqlContextFactory.CreateDbContextAsync();
+
+            // {Check if customer or organization number already exists}
+            var exists = await context.GrefurCustomers
+                .AnyAsync(c => c.CustomerId == customer.CustomerId || c.OrganizationNumber == customer.OrganizationNumber);
+
+            if (exists) return false;
+
+            // {1. Create the customer record first (pure organization data)}
+            customer.CreatedAt = DateTime.UtcNow;
+            customer.IsEnabled = true;
+
+            context.GrefurCustomers.Add(customer);
+            await context.SaveChangesAsync();
+
+            // {2. Create the separate admin user record via UserService}
+            var initialUser = new GrefurUser
+            {
+                UserId = Guid.NewGuid().ToString(),
+                Email = customer.EmailOfOrganization,
+                PasswordHash = "admin", // {UserService hashes this}
+                CustomerId = customer.CustomerId,
+                Role = UserRole.Admin,
+                ForcePasswordChange = true, // {Moved here to the User model}
+                CreatedAt = DateTime.UtcNow
+            };
+
+            await _userService.CreateUserAsync(initialUser);
+
+            _logger.LogInformation("[Grefur]: New customer {Id} created with a separate admin user.", customer.CustomerId);
+            return true;
+        }
+
+
+
+
+        public async Task<string?> DeleteCustomerAsync(string customerId)
         {
             try
             {
-                await _context.GrefurCustomers.AddAsync(Config).ConfigureAwait(false);
-                await _context.SaveChangesAsync().ConfigureAwait(false);
-                return true;
+                using var context = await _mySqlContextFactory.CreateDbContextAsync();
+                var customer = await context.GrefurCustomers
+                    .FirstOrDefaultAsync(c => c.CustomerId == customerId);
+
+                if (customer == null) return "NOT_FOUND";
+
+                // Business logic: Hindre sletting hvis kunden har aktive noder i produksjon
+                var hasDevices = await context.GrefurDevices.AnyAsync(d => d.CustomerId == customerId);
+                if (hasDevices) return "HAS_ACTIVE_DEVICES";
+
+                context.GrefurCustomers.Remove(customer);
+                await context.SaveChangesAsync();
+
+                _logger.LogWarning("Customer {Id} and all associated data purged from Grefur", customerId);
+
+                // await _eventBus.Publish(new CustomerDeletedEvent(customerId));
+
+                return "SUCCESS";
             }
-            catch (Exception Ex)
+            catch (Exception ex)
             {
-                _logger.LogError(Ex, "Error creating customer {CustomerId}", Config.CustomerId);
-                return false;
+                _logger.LogError(ex, "Error deleting customer {CustomerId}", customerId);
+                return "ERROR";
             }
         }
 
-        public async Task<bool> EditCustomer(GrefurCustomer Config)
+        public async Task<(bool Success, GrefurCustomer? Customer)> EditCustomerAsync(GrefurCustomer config)
         {
             try
             {
-                var Existing = await _context.GrefurCustomers
-                    .FirstOrDefaultAsync(C => C.CustomerId == Config.CustomerId)
+                using var context = await _mySqlContextFactory.CreateDbContextAsync();
+                var existing = await context.GrefurCustomers
+                    .FirstOrDefaultAsync(c => c.CustomerId == config.CustomerId)
                     .ConfigureAwait(false);
 
-                if (Existing == null) return false;
+                if (existing == null) return (false, null);
 
-                Existing.OrganizationName = Config.OrganizationName;
-                Existing.OrganizationNumber = Config.OrganizationNumber;
-                Existing.IsEnabled = Config.IsEnabled;
-                Existing.RegisteredDevices = Config.RegisteredDevices;
-                Existing.LogSubscription = Config.LogSubscription;
-                Existing.AlarmSubscription = Config.AlarmSubscription;
-                Existing.NotificationTypes = Config.NotificationTypes;
+                // {1. Apply changes dynamically from the incoming config to the existing entity}
+                context.Entry(existing).CurrentValues.SetValues(config);
 
-                await _context.SaveChangesAsync().ConfigureAwait(false);
-                return true;
+                // {2. Check for changes using the ChangeTracker before saving}
+                var entry = context.Entry(existing);
+
+                // Capture change flags for events
+                bool statusChanged = entry.Property(c => c.IsEnabled).IsModified;
+                bool policiesChanged = entry.Property(c => c.LogSubscription).IsModified ||
+                                       entry.Property(c => c.AlarmSubscription).IsModified;
+                bool notifyChanged = entry.Property(c => c.NotificationSubscription).IsModified;
+
+                // {3. Persist changes}
+                if (entry.State == EntityState.Modified)
+                {
+                    await context.SaveChangesAsync().ConfigureAwait(false);
+
+                    // --- Trigger Domain Events dynamically based on detected changes ---
+                    if (statusChanged)
+                    {
+                        _logger.LogInformation("[Grefur]: Status changed for {CustomerId} to {Status}",
+                            existing.CustomerId, existing.IsEnabled);
+                    }
+
+                    if (policiesChanged)
+                    {
+                        _logger.LogInformation("[Grefur]: Policies updated for {CustomerId}", existing.CustomerId);
+                        // Her kan du også trigge et event til Brokeren din (EMQX) om nye rettigheter
+                    }
+
+                    if (notifyChanged)
+                    {
+                        _logger.LogInformation("[Grefur]: Notification preference updated for {CustomerId}", existing.CustomerId);
+                    }
+                }
+
+                return (true, existing);
             }
-            catch (Exception Ex)
+            catch (Exception ex)
             {
-                _logger.LogError(Ex, "Error editing customer {CustomerId}", Config.CustomerId);
-                return false;
+                _logger.LogError(ex, "[Grefur]: Error editing customer {CustomerId}", config.CustomerId);
+                return (false, null);
             }
         }
 
-        public async Task<bool> DeleteCustomer(string CustomerId)
+        public async Task<List<GrefurCustomer>> GetAllCustomersAsync()
         {
-            try
-            {
-                var Customer = await _context.GrefurCustomers
-                    .FirstOrDefaultAsync(C => C.CustomerId == CustomerId)
-                    .ConfigureAwait(false);
+            using var context = await _mySqlContextFactory.CreateDbContextAsync();
+            return await context.GrefurCustomers.ToListAsync().ConfigureAwait(false);
+        }
 
-                if (Customer == null) return false;
+        public async Task<GrefurCustomer?> GetCustomerByIdAsync(string CustomerId)
+        {
+            using var context = await _mySqlContextFactory.CreateDbContextAsync();
+            return await context.GrefurCustomers
+                .FirstOrDefaultAsync(c => c.CustomerId == CustomerId)
+                .ConfigureAwait(false);
+        }
 
-                _context.GrefurCustomers.Remove(Customer);
-                await _context.SaveChangesAsync().ConfigureAwait(false);
-                return true;
-            }
-            catch (Exception Ex)
+        public async Task<GrefurCustomer?> GetCustomerByDeviceIdAsync(string DeviceId)
+        {
+            using var context = await _mySqlContextFactory.CreateDbContextAsync();
+
+            var device = await context.GrefurDevices
+                .FirstOrDefaultAsync(d => d.DeviceId == DeviceId)
+                .ConfigureAwait(false);
+
+            if (device == null)
             {
-                _logger.LogError(Ex, "Error deleting customer {CustomerId}", CustomerId);
-                return false;
+                _logger.LogWarning("Device {DeviceId} not found in database.", DeviceId);
+                return null;
             }
+
+            return await context.GrefurCustomers
+                .FirstOrDefaultAsync(c => c.CustomerId == device.CustomerId)
+                .ConfigureAwait(false);
+        }
+
+        public async Task<List<GrefurCustomer>> GetAllActiveSubscribersAsync()
+        {
+            using var context = await _mySqlContextFactory.CreateDbContextAsync();
+
+            // Vi flytter logikken fra IsActiveSubscriber() inn i Where-klausulen
+            // slik at databasen gjør jobben.
+            var activeCustomers = await context.GrefurCustomers
+                .Where(c => c.IsEnabled &&
+                           (c.LogSubscription != LogSubscriptionLevel.None ||
+                            c.AlarmSubscription != AlarmLevel.None))
+                .OrderByDescending(c => c.CreatedAt) // Sortering skjer i SQL
+                .ToListAsync()
+                .ConfigureAwait(false);
+
+            _logger.LogInformation("Found {Count} active customers via optimized SQL query.", activeCustomers.Count);
+
+            return activeCustomers;
         }
 
         public async Task Handle(CustomerQueryEvent Evt)
         {
-            var Customer = await GetCustomerByDeviceIdAsync(Evt.DeviceId).ConfigureAwait(false);
-            if (Customer != null)
+            var customer = await GetCustomerByDeviceIdAsync(Evt.DeviceId).ConfigureAwait(false);
+            if (customer != null)
             {
-                var Response = new CustomerQueryResponseEvent(
+                var response = new CustomerQueryResponseEvent(
                     deviceId: Evt.DeviceId,
-                    customerIdParam: Customer.CustomerId,
+                    customerIdParam: customer.CustomerId,
                     source: nameof(CustomerService),
                     correlationId: Evt.CorrelationId
                 );
-                await _eventBus.Publish(Response).ConfigureAwait(false);
+                await _eventBus.Publish(response).ConfigureAwait(false);
             }
         }
 
         public async Task Handle(RequestCustomerValueEnrichmentEvent Evt)
         {
-            _logger.LogDebug("[CustomerService]: Received RequestCustomerValueEnrichmentEvent - Event details: {@event}", Evt);
+            _logger.LogDebug("[CustomerService]: Enriching data for device {DeviceId}", Evt.DeviceId);
 
-            var Customer = await GetCustomerByDeviceIdAsync(Evt.DeviceId).ConfigureAwait(false);
+            var customer = await GetCustomerByDeviceIdAsync(Evt.DeviceId).ConfigureAwait(false);
 
-            if (Customer == null)
+            if (customer == null)
             {
-                _logger.LogWarning("[CustomerService]: Could not find customer for device {DeviceId} during enrichment.", Evt.DeviceId);
+                _logger.LogWarning("[CustomerService]: No customer found for {DeviceId}.", Evt.DeviceId);
+                var unknownValueEvent = new UnknownValueEvent(
+                    Topic: Evt.Topic,
+                    Source: nameof(CustomerService),
+                    CorrelationId: Evt.CorrelationId
+                );
+
+                await _eventBus.Publish(unknownValueEvent).ConfigureAwait(false);
+
                 return;
             }
 
-            int alarmLevelValue = (int)Customer.AlarmSubscription;
-            int logLevelValue = (int)Customer.LogSubscription;
 
-            var Response = new ResponseCustomerValueEnrichmentEvent(
-                Customer: Customer,
-                SubscriptionId: $"SUB-{Customer.CustomerId}",
-                AlarmPolicyLevel: Customer.AlarmSubscription,
-                LogPolicyLevel: Customer.LogSubscription,
+
+            if (customer.AlarmSubscription == 0 && customer.LogSubscription == 0 /* NotificationSubscription*/)
+            {
+                _logger.LogWarning("[CustomerService]: No point of subscribing to {DeviceId}.", Evt.DeviceId);
+                var unknownValueEvent = new UnknownValueEvent(
+                    Topic: Evt.Topic,
+                    Source: nameof(CustomerService),
+                    CorrelationId: Evt.CorrelationId
+                );
+
+                await _eventBus.Publish(unknownValueEvent).ConfigureAwait(false);
+
+                return;
+            }
+
+            var response = new ResponseCustomerValueEnrichmentEvent(
+                Customer: customer,
+                SubscriptionId: $"SUB-{customer.CustomerId}",
+                AlarmPolicyLevel: customer.AlarmSubscription,
+                LogPolicyLevel: customer.LogSubscription,
                 Source: nameof(CustomerService),
                 CorrelationId: Evt.CorrelationId,
                 DeviceId: Evt.DeviceId,
@@ -137,100 +286,115 @@ namespace grefurBackend.Services
                 ValueType: Evt.ValueType
             );
 
-            _logger.LogDebug("[CustomerService]: Publishing response to EventBus with CorrelationId: {CorrelationId}", Evt.CorrelationId);
+            try
+            {
+                await _eventBus.Publish(response).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[CustomerService]: Error publishing enrichment for {CustomerId}", customer.CustomerId);
+            }
+        }
+
+        public async Task Handle(SystemReadyEvent Evt)
+        {
+            _logger.LogInformation("[CustomerService]: SystemReadyEvent received. Checking for system admin...");
 
             try
             {
-                await _eventBus.Publish(Response).ConfigureAwait(false);
-                _logger.LogDebug("[CustomerService]: Successfully published levels for {CustomerId}. Log: {LogLevel}, Alarm: {AlarmLevel}",
-                    Customer.CustomerId, logLevelValue, alarmLevelValue);
-            }
-            catch (Exception Ex)
-            {
-                _logger.LogError(Ex, "[CustomerService]: Error publishing enrichment response for customer {CustomerId}", Customer.CustomerId);
-            }
-        }
+                using var context = await _mySqlContextFactory.CreateDbContextAsync();
 
-        public async Task<List<GrefurCustomer>> GetAllActiveSubscribersAsync()
-        {
-            var AllCustomers = await GetAllCustomersMockAsync().ConfigureAwait(false);
+                var existingAdmin = await context.GrefurUsers
+                    .FirstOrDefaultAsync(u =>
+                        (u.Email == "admin@grefur.com" &&
+                        u.Role == UserRole.SystemAdmin
+                        ));
 
-            var ActiveCustomers = AllCustomers
-                .Where(C => C.IsActiveSubscriber())
-                .ToList();
 
-            _logger.LogInformation("Found {Count} active customers with dynamic subscription check.", ActiveCustomers.Count);
-
-            foreach (var Customer in ActiveCustomers)
-            {
-                var DomainEvent = new CustomerLoadedEvent(
-                    Customer: Customer,
-                    Source: nameof(CustomerService),
-                    CorrelationId: Guid.NewGuid().ToString()
-                );
-
-                await _eventBus.Publish(DomainEvent).ConfigureAwait(false);
-            }
-
-            return ActiveCustomers;
-        }
-
-        public async Task<GrefurCustomer?> GetCustomerByIdAsync(string CustomerId)
-        {
-            var Customers = await GetAllCustomersMockAsync().ConfigureAwait(false);
-            var Customer = Customers.FirstOrDefault(C => C.CustomerId == CustomerId);
-
-            if (Customer == null)
-            {
-                _logger.LogWarning("Customer {CustomerId} not found.", CustomerId);
-            }
-
-            return Customer;
-        }
-
-        public async Task<GrefurCustomer?> GetCustomerByDeviceIdAsync(string DeviceId)
-        {
-            var Customers = await GetAllCustomersMockAsync().ConfigureAwait(false);
-            var Customer = Customers.FirstOrDefault(C => C.RegisteredDevices.Contains(DeviceId));
-
-            if (Customer == null)
-            {
-                _logger.LogWarning("Device {DeviceId} is not registered to any Grefur customer.", DeviceId);
-            }
-
-            return Customer;
-        }
-
-        private async Task<List<GrefurCustomer>> GetAllCustomersMockAsync()
-        {
-            return await _context.GrefurCustomers.ToListAsync().ConfigureAwait(false);
-        }
-
-        private List<GrefurCustomer> GenerateTestCustomers(int Count)
-        {
-            var CustomerList = new List<GrefurCustomer>();
-
-            for (int i = 1; i <= Count; i++)
-            {
-                string CustomerId = $"CUST-{(i + 2):D3}";
-
-                var NewCustomer = new GrefurCustomer
+                if (existingAdmin == null)
                 {
-                    CustomerId = CustomerId,
-                    RegisteredDevices = new List<string>
+                    string defaultAdminPassword = "admin";
+                    string passwordHash = BCrypt.Net.BCrypt.HashPassword(defaultAdminPassword);
+
+                    var systemAdmin = new GrefurUser
                     {
-                        $"Grefur_{i}",
-                        $"Grefur_{i}"
-                    },
-                    LogSubscription = SubscriptionLevel.Normal,
-                    AlarmSubscription = AlarmLevel.None,
-                    NotificationTypes = NotificationTypes.None
-                };
+                        UserId = Guid.NewGuid().ToString(),
+                        PasswordHash = passwordHash,
+                        Email = "admin@grefur.com",
+                        CustomerId = "GREFUR-INTERNAL",
+                        Role = UserRole.SystemAdmin,
+                        IsEnabled = true,
+                        ForcePasswordChange = false,
+                        CreatedAt = DateTime.UtcNow,
+                        MetadataJson = "{\"note\": \"Initial system administrator\"}"
+                    };
 
-                CustomerList.Add(NewCustomer);
+                    context.GrefurUsers.Add(systemAdmin);
+                    await context.SaveChangesAsync();
+
+                    _logger.LogInformation("[Seed]: SystemAdmin 'admin_admin' created successfully.");
+                }
             }
-
-            return CustomerList;
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Seed]: Failed to seed SystemAdmin during SystemReadyEvent.");
+            }
         }
+
+        public async Task<object?> GetCustomerServicesStatusAsync(string customerId)
+        {
+            var customer = await GetCustomerByIdAsync(customerId).ConfigureAwait(false);
+            if (customer == null) return null;
+
+            string DetermineStatus(Enum subscription) => Convert.ToInt32(subscription) == 0 ? "Inactive" : "Active";
+
+            return new
+            {
+                customerId = customer.CustomerId,
+                isEnabled = customer.IsEnabled,
+                // Fikser CS0826 ved å bruke en eksplisitt liste i stedet for implicit array
+                services = new List<object>
+                {
+                    new
+                    {
+                        serviceName = "LoggerService",
+                        status = DetermineStatus(customer.LogSubscription),
+                        level = customer.LogSubscription.ToString()
+                    },
+                    new
+                    {
+                        serviceName = "AlarmService",
+                        status = DetermineStatus(customer.AlarmSubscription),
+                        level = customer.AlarmSubscription.ToString()
+                    },
+                    new
+                    {
+                        serviceName = "NotificationService",
+                        status = DetermineStatus(customer.NotificationSubscription),
+                        type = customer.NotificationSubscription.ToString()
+                    }
+                },
+                timestamp = DateTime.UtcNow
+            };
+        }
+
+        public async Task<object?> GetCustomerMetadataAsync(string customerId)
+        {
+            var customer = await GetCustomerByIdAsync(customerId).ConfigureAwait(false);
+            if (customer == null) return null;
+
+            return new
+            {
+                organization = new
+                {
+                    id = customer.CustomerId,
+                    name = customer.OrganizationName,
+                    email = customer.EmailOfOrganization,
+                    memberSince = customer.CreatedAt
+                }
+                
+            };
+        }
+
     }
 }

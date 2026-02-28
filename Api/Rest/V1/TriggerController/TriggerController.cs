@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using grefurBackend.Infrastructure;
-using grefurBackend.Services;
+using System.Text.Json;
 
 namespace grefurBackend.Api.Rest.V1
 {
@@ -18,11 +18,25 @@ namespace grefurBackend.Api.Rest.V1
         }
 
         [HttpGet]
-        public async Task<IActionResult> Get([FromQuery] string events)
+        public async Task<IActionResult> Get([FromQuery] string events, [FromQuery] string? props)
         {
             if (string.IsNullOrWhiteSpace(events)) return BadRequest("No events specified");
 
             _logger.LogInformation("TriggerController: Received request for events: {Events}", events);
+
+            // Parser JSON-strengen til en Dictionary for enkel tilgang til egenskaper
+            var propDictionary = new Dictionary<string, string>();
+            if (!string.IsNullOrWhiteSpace(props))
+            {
+                try
+                {
+                    propDictionary = JsonSerializer.Deserialize<Dictionary<string, string>>(props) ?? new();
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogWarning(ex, "TriggerController: Failed to parse props JSON");
+                }
+            }
 
             var eventList = events.Split(',', StringSplitOptions.RemoveEmptyEntries);
             var responses = new List<object>();
@@ -30,14 +44,15 @@ namespace grefurBackend.Api.Rest.V1
             foreach (var evt in eventList)
             {
                 var trimmedEvent = evt.Trim();
-                var response = await ProcessTriggerEventAsync(trimmedEvent);
+                // Sender ordboken videre til prosessering
+                var response = await ProcessTriggerEventAsync(trimmedEvent, propDictionary);
                 responses.Add(response);
             }
 
             return Ok(responses);
         }
 
-        private async Task<object> ProcessTriggerEventAsync(string eventName)
+        private async Task<object> ProcessTriggerEventAsync(string eventName, Dictionary<string, string> props)
         {
             var correlationId = Guid.NewGuid().ToString();
 
@@ -45,8 +60,9 @@ namespace grefurBackend.Api.Rest.V1
 
             return eventName switch
             {
-                "TrainAndPublish" => await HandleTrainAndPublishAsync(correlationId),
-                "ChangeCustomerData" => await HandleCustomerChangeAsync(correlationId),
+                "TrainAndPublish" => await HandleTrainAndPublishAsync(correlationId, props),
+                //"ChangeCustomerData" => await HandleCustomerChangeAsync(correlationId, props),
+                "RetrieveLogs" => await HandleRetrieveLogsAsync(correlationId, props),
                 _ => new { Event = eventName, Status = "Unknown event" }
             };
         }

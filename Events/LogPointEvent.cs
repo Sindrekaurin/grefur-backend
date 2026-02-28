@@ -6,7 +6,7 @@ public enum LogPointStatus
     Received,
     Created,
     Deleted,
-    Failed
+    Failed,
 }
 
 public sealed class LogPointEvent : Event

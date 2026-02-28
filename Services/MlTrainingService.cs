@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.IO;
+using System.Globalization;
 using grefurBackend.Models;
 using grefurBackend.Models.AlarmConfiguration;
 using grefurBackend.Services;
@@ -10,7 +12,8 @@ using Microsoft.Extensions.Logging;
 using grefurBackend.Types;
 using Microsoft.ML;
 using Microsoft.ML.Data;
-
+using Microsoft.EntityFrameworkCore;
+using grefurBackend.Context;
 
 namespace grefurBackend.Services
 {
@@ -20,30 +23,29 @@ namespace grefurBackend.Services
         public string Message { get; set; } = string.Empty;
     }
 
+    /* Summary of class: Service responsible for orchestrating the ML lifecycle, 
+       utilizing TimescaleDB for telemetry and MySQL for alarm configurations. */
     public class MlTrainingService
     {
         private readonly AlarmService _alarmService;
         private readonly LoggerService _loggerService;
         private readonly ILogger<MlTrainingService> _logger;
+        private readonly IDbContextFactory<MySqlContext> _mySqlContext;
 
         public MlTrainingService(
-            AlarmService AlarmService,
-            LoggerService LoggerService,
-            ILogger<MlTrainingService> Logger)
+            AlarmService alarmService,
+            LoggerService loggerService,
+            ILogger<MlTrainingService> logger,
+            IDbContextFactory<MySqlContext> mySqlContext
+            )
         {
-            _alarmService = AlarmService;
-            _loggerService = LoggerService;
-            _logger = Logger;
+            _alarmService = alarmService;
+            _loggerService = loggerService;
+            _logger = logger;
+            _mySqlContext = mySqlContext;
         }
 
-        private MlAlarmConfiguration testConfig = new MlAlarmConfiguration
-        {
-            CustomerId = "CUST-001",
-            TargetMeasurementId = "Grefur_3461/900/320/001/RT401/value",
-            FeatureMeasurementIds = new List<string>(),
-            TrainingFrequency = TrainingFrequency.Weekly
-        };
-
+        /* Summary of function: Aligns multiple sensor data streams into a single time-synchronized matrix. */
         private List<MlDataRow> AlignData(
             DateTime start,
             DateTime end,
@@ -53,7 +55,6 @@ namespace grefurBackend.Services
         {
             var alignedRows = new List<MlDataRow>();
 
-            // Gå gjennom tidsperioden steg for steg
             for (DateTime current = start; current <= end; current = current.Add(interval))
             {
                 var features = new Dictionary<string, float>();
@@ -64,7 +65,6 @@ namespace grefurBackend.Services
                     var featureId = entry.Key;
                     var dataPoints = entry.Value;
 
-                    // Finn den nyeste verdien som er eldre eller lik 'current' (Forward Fill)
                     var closestPoint = dataPoints
                         .Where(lp => lp.timestamp <= current)
                         .OrderByDescending(lp => lp.timestamp)
@@ -76,7 +76,6 @@ namespace grefurBackend.Services
                     }
                     else
                     {
-                        // Hvis vi mangler data for en feature i starten av perioden, hopper vi over denne raden
                         allFeaturesFound = false;
                         break;
                     }
@@ -84,7 +83,6 @@ namespace grefurBackend.Services
 
                 if (!allFeaturesFound) continue;
 
-                // Finn målverdien (Label) for samme tidspunkt
                 var targetPoint = targetData
                     .Where(lp => lp.timestamp <= current)
                     .OrderByDescending(lp => lp.timestamp)
@@ -104,157 +102,141 @@ namespace grefurBackend.Services
             return alignedRows;
         }
 
+        /* Summary of function: Converts local data objects into a ML.NET IDataView with fixed-size feature vectors. */
         private IDataView CreateDynamicFeatureMatrixAndLabels(MLContext mlContext, List<MlDataRow> alignedRows)
         {
-            // 1. Konverter alignedRows til MlTrainingData objekter
+            var firstRow = alignedRows.FirstOrDefault();
+            int featureCount = firstRow?.Features.Count ?? 0;
+
             var observations = alignedRows.Select(row => new MlTrainingData
             {
                 Label = row.Label,
-                // Sortering er kritisk for at Feature[0] alltid er samme sensor i hele datasettet
                 Features = row.Features
                     .OrderBy(f => f.Key)
                     .Select(f => f.Value)
                     .ToArray()
             }).ToList();
 
-            _logger.LogInformation("[MlTrainingService]: Matrix built with {RowBase} rows and {FeatureCount} features per row.",
-                observations.Count,
-                observations.FirstOrDefault()?.Features.Length ?? 0);
+            var schemaDefinition = SchemaDefinition.Create(typeof(MlTrainingData));
+            schemaDefinition[nameof(MlTrainingData.Features)].ColumnType = new VectorDataViewType(NumberDataViewType.Single, featureCount);
 
-            // 2. Last inn i IDataView
-            return mlContext.Data.LoadFromEnumerable(observations);
+            _logger.LogInformation("[MlTrainingService]: Matrix built with {RowBase} rows and {FeatureCount} features.",
+                observations.Count, featureCount);
+
+            return mlContext.Data.LoadFromEnumerable(observations, schemaDefinition);
         }
 
-        public async Task<MlTrainingResult> TrainAndPublish(MlAlarmConfiguration Config, CancellationToken CancellationToken = default)
+        /* Summary of function: Performs data gathering, model training via SDCA regression, and saves the binary model file. */
+        public async Task<MlTrainingResult> TrainAndPublish(MlAlarmConfiguration config, CancellationToken cancellationToken = default)
         {
             try
             {
-                _logger.LogInformation("[MlTrainingService]: Starting training for Customer {CustomerId}, Target {TargetMeasurementId}",
-                    Config.CustomerId, Config.TargetMeasurementId);
+                _logger.LogInformation("[MlTrainingService]: Starting training for Customer {CustomerId}, Target {TargetId}",
+                    config.CustomerId, config.TargetMeasurementId);
 
-                // 1. Sett tidsperiode
-                var End = DateTime.UtcNow;
-                DateTime Start = Config.TrainingFrequency switch
+                var end = DateTime.UtcNow;
+                DateTime start = config.TrainingFrequency switch
                 {
-                    TrainingFrequency.Weekly => End.AddDays(-7),
-                    TrainingFrequency.Monthly => End.AddMonths(-1),
-                    _ => End.AddDays(-7)
+                    TrainingFrequency.Weekly => end.AddDays(-7),
+                    TrainingFrequency.Monthly => end.AddMonths(-1),
+                    _ => end.AddDays(-7)
                 };
 
-                _logger.LogInformation("[MlTrainingService]: Training period from {Start} to {End}", Start, End);
-
-                // 2. Hent treningsdata for hver feature
-                var FeatureData = new Dictionary<string, IReadOnlyList<LogPoint>>();
-                foreach (var FeatureMeasurementId in Config.FeatureMeasurementIds)
+                var featureData = new Dictionary<string, IReadOnlyList<LogPoint>>();
+                foreach (var featureId in config.FeatureMeasurementIds)
                 {
-                    var Log = await _loggerService.getLogAsync(
-                        FeatureMeasurementId,
-                        Start,
-                        End,
-                        CancellationToken
-                    );
-
-                    FeatureData[FeatureMeasurementId] = Log;
-                    _logger.LogInformation("[MlTrainingService]: Fetched {Count} points for feature {Feature}", Log.Count, FeatureMeasurementId);
+                    var log = await _loggerService.GetLogAsync(featureId, start, end, cancellationToken);
+                    featureData[featureId] = log;
                 }
 
-                // 3. Hent målverdi
-                var TargetData = await _loggerService.getLogAsync(
-                    Config.TargetMeasurementId,
-                    Start,
-                    End,
-                    CancellationToken
-                );
-
-                _logger.LogInformation("[MlTrainingService]: Fetched {Count} points for target {Target}", TargetData.Count, Config.TargetMeasurementId);
-
-                foreach (var lp in TargetData.Take(3))
-                {
-                    _logger.LogInformation("[MlTrainingService]: Target {Target}: {Time} -> {Value}", Config.TargetMeasurementId, lp.timestamp, lp.value);
-                }
-
-
-                // 4. Time-align features og target
-                var sampleInterval = TimeSpan.FromMinutes(Config.SampleIntervalMinutes); // Defined in customers alarm setup
-                var alignedRows = AlignData(Start, End, TargetData, FeatureData, sampleInterval);
-
-                _logger.LogInformation("[MlTrainingService]: Created {Count} aligned data rows for training", alignedRows.Count);
-
-                // Logg hver eneste rad
-                foreach (var row in alignedRows)
-                {
-                    // Bygg en streng for alle features (f.eks. RT901: 22.5, RT902: 40.1)
-                    string featureString = string.Join(", ", row.Features.Select(f => $"{f.Key}: {f.Value:F2}"));
-
-                    _logger.LogInformation("[DATA-ROW] {Timestamp} | Features: [{Features}] | Label (Target): {Label:F2}",
-                        row.Timestamp.ToString("yyyy-MM-dd HH:mm:ss"),
-                        featureString,
-                        row.Label);
-                }
+                var targetData = await _loggerService.GetLogAsync(config.TargetMeasurementId, start, end, cancellationToken);
+                var sampleInterval = TimeSpan.FromMinutes(config.SampleIntervalMinutes);
+                var alignedRows = AlignData(start, end, targetData, featureData, sampleInterval);
 
                 if (alignedRows.Count < 10)
                 {
-                    _logger.LogWarning("[MlTrainingService]: Not enough aligned data to train. Rows: {Count}", alignedRows.Count);
-                    return new MlTrainingResult { Success = false, Message = "Too little data for alignment." };
+                    return new MlTrainingResult { Success = false, Message = "Insufficient aligned data for model training." };
                 }
 
-                // --- TODO: 5. Bygg feature matrise og labels ---
                 var mlContext = new MLContext(seed: 42);
                 var trainingDataView = CreateDynamicFeatureMatrixAndLabels(mlContext, alignedRows);
 
-                // --- TODO: 6. Tren ML-modell ---
-                // Vi bruker en enkel rørledning: Konkatenert data -> Trener
-                var pipeline = mlContext.Regression.Trainers.Sdca(
-                    labelColumnName: "Label",
-                    featureColumnName: "Features"
-                );
+                var pipeline = mlContext.Transforms.NormalizeMinMax("Features")
+                    .Append(mlContext.Regression.Trainers.Sdca(
+                        labelColumnName: "Label",
+                        featureColumnName: "Features"
+                    ));
 
-                _logger.LogInformation("[MlTrainingService]: Starting SDCA Regression training...");
+                _logger.LogInformation("[MlTrainingService]: Training SDCA Regression model...");
                 var model = pipeline.Fit(trainingDataView);
-                _logger.LogInformation("[MlTrainingService]: Model training completed.");
 
-                // --- TODO: 7. Save model and metadata ---
-
-                // Create a safe filename based on the target (e.g., CUST-001_Grefur_3461_RT401_value_v1.zip)
-                string safeTargetName = Config.TargetMeasurementId.Replace("/", "_").Replace("\\", "_");
-                string modelFileName = $"{Config.CustomerId}_{safeTargetName}_v{Config.ModelVersion}.zip";
+                string safeTargetName = config.TargetMeasurementId.Replace("/", "_").Replace("\\", "_");
+                string modelFileName = $"{config.CustomerId}_{safeTargetName}_v{config.ModelVersion}.zip";
 
                 using (var modelStream = new MemoryStream())
                 {
-                    // ML.NET saves the trained model and the input schema to a stream
                     mlContext.Model.Save(model, trainingDataView.Schema, modelStream);
-
-                    // Convert stream to byte array to hand over to LoggerService
                     byte[] modelBytes = modelStream.ToArray();
-                    bool saveSuccess = await _loggerService.saveBinaryFileAsync(modelFileName, modelBytes);
+
+                    bool saveSuccess = await SaveBinaryFileAsync(modelFileName, modelBytes);
 
                     if (!saveSuccess)
                     {
-                        throw new Exception($"Failed to save model file {modelFileName} via LoggerService");
+                        throw new Exception($"Failed to save model file {modelFileName} to storage.");
                     }
                 }
 
-                _logger.LogInformation("[MlTrainingService]: Model saved successfully as {FileName}", modelFileName);
-
-                // TODO: 8. Publiser ModelUpdatedEvent
+                _logger.LogInformation("[MlTrainingService]: Model saved successfully: {FileName}", modelFileName);
 
                 return new MlTrainingResult
                 {
                     Success = true,
-                    Message = $"Successfully processed {TargetData.Count} points for {Config.TargetMeasurementId}"
+                    Message = $"Trained model for {config.TargetMeasurementId} using {alignedRows.Count} aligned samples."
                 };
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[MlTrainingService]: Error during TrainAndPublish for {TargetId}", Config.TargetMeasurementId);
-                return new MlTrainingResult
-                {
-                    Success = false,
-                    Message = ex.Message
-                };
+                _logger.LogError(ex, "[MlTrainingService]: Training failed for {TargetId}", config.TargetMeasurementId);
+                return new MlTrainingResult { Success = false, Message = ex.Message };
             }
         }
 
+        /* Summary of function: Persists the model bytes to the local file system in a dedicated directory. */
+        private async Task<bool> SaveBinaryFileAsync(string fileName, byte[] data)
+        {
+            try
+            {
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string rootPath = baseDir.Contains(Path.Combine("bin", "Debug")) || baseDir.Contains(Path.Combine("bin", "Release"))
+                    ? Path.GetFullPath(Path.Combine(baseDir, "..", "..", ".."))
+                    : baseDir;
 
+                string storagePath = Path.Combine(rootPath, "MachineLearningModels");
+
+                if (!Directory.Exists(storagePath))
+                {
+                    Directory.CreateDirectory(storagePath);
+                }
+
+                string filePath = Path.Combine(storagePath, fileName);
+                await File.WriteAllBytesAsync(filePath, data).ConfigureAwait(false);
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "MlTrainingService: Model file save failed for {FileName}", fileName);
+                return false;
+            }
+        }
+
+        /* Summary of function: Retrieves ML alarm configurations from the MySQL database context factory. */
+        public async Task<List<MlAlarmConfiguration>> GetAllMlAlarmConfigurationsAsync(CancellationToken ct = default)
+        {
+            using var context = await _mySqlContext.CreateDbContextAsync(ct);
+            return await context.Set<MlAlarmConfiguration>()
+                .AsNoTracking()
+                .ToListAsync(ct);
+        }
     }
 }

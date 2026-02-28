@@ -43,3 +43,35 @@ public sealed class TopicBoundEvent : Event
         StatusMessage = statusMessage;
     }
 }
+
+
+public sealed class TopicBoundRemovedEvent : Event
+{
+    public required string CustomerId { get; init; }
+    public required string DeviceId { get; init; }
+    public required string BaseTopic { get; init; }
+    public TopicBoundStatus Status { get; init; }
+    public string? StatusMessage { get; init; }
+
+    [System.Diagnostics.CodeAnalysis.SetsRequiredMembers]
+    public TopicBoundRemovedEvent(
+        string customerId,
+        string deviceId,
+        string baseTopic,
+        TopicBoundStatus status,
+        string source,
+        string correlationId,
+        string? statusMessage = null)
+        : base(
+            eventType: "TopicBoundRemoved", // Endret til Removed for tydelighet
+            source: source,
+            correlationId: correlationId,
+            payload: new { customerId, deviceId, baseTopic, status, statusMessage })
+    {
+        CustomerId = customerId;
+        DeviceId = deviceId;
+        BaseTopic = baseTopic;
+        Status = status;
+        StatusMessage = statusMessage;
+    }
+}

@@ -1,6 +1,3 @@
-/*
- * CacheService.cs
- */
 using System;
 using System.Linq;
 using System.Threading;
@@ -8,9 +5,11 @@ using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
+using Microsoft.EntityFrameworkCore;
 using grefurBackend.Models;
 using grefurBackend.Events.Domain;
 using grefurBackend.Infrastructure;
+using grefurBackend.Context;
 
 namespace grefurBackend.Services;
 
@@ -19,34 +18,36 @@ public class CacheService : IEventHandler<CustomerLoadedEvent>, IDisposable
     private readonly ILogger<CacheService> _logger;
     private readonly EventBus _eventBus;
     private readonly CustomerService _customerService;
+    private readonly IDbContextFactory<MySqlContext> _contextFactory;
 
     private readonly ConcurrentDictionary<string, GrefurCustomer> _deviceToCustomerCache = new();
     private readonly ConcurrentDictionary<string, DateTime> _deviceCacheTimestamps = new();
     private readonly TimeSpan _cacheTimeout = TimeSpan.FromMinutes(10);
     private Timer? _cleanupTimer;
 
-    public CacheService(ILogger<CacheService> logger, EventBus eventBus, CustomerService customerService)
+    public CacheService(
+        ILogger<CacheService> logger,
+        EventBus eventBus,
+        CustomerService customerService,
+        IDbContextFactory<MySqlContext> contextFactory)
     {
         _logger = logger;
         _eventBus = eventBus;
         _customerService = customerService;
+        _contextFactory = contextFactory;
 
-        // Subscribe to CustomerLoadedEvent
         _eventBus.Subscribe<CustomerLoadedEvent>(this);
 
         StartCleanupTimer();
     }
 
-    // Handle CustomerLoadedEvent to warm up cache
     public async Task Handle(CustomerLoadedEvent domainEvent)
     {
-        // Merk: Antar CustomerLoadedEvent har Customer-objektet eller en CustomerId property med stor C
         var customerId = domainEvent.Customer?.CustomerId ?? "Unknown";
         _logger.LogInformation("[CacheService]: Warming cache for customer {CustomerId}", customerId);
 
         try
         {
-            // Use CustomerService to fetch the full customer (including devices)
             var customer = await _customerService.GetCustomerByIdAsync(customerId).ConfigureAwait(false);
             if (customer == null)
             {
@@ -54,7 +55,14 @@ public class CacheService : IEventHandler<CustomerLoadedEvent>, IDisposable
             }
             else
             {
-                foreach (var deviceId in customer.RegisteredDevices ?? Enumerable.Empty<string>())
+                using var context = await _contextFactory.CreateDbContextAsync().ConfigureAwait(false);
+                var deviceIds = await context.GrefurDevices
+                    .Where(d => d.CustomerId == customerId && !d.IsDeletedByCustomer)
+                    .Select(d => d.DeviceId)
+                    .ToListAsync()
+                    .ConfigureAwait(false);
+
+                foreach (var deviceId in deviceIds)
                 {
                     _deviceToCustomerCache[deviceId] = customer;
                     _deviceCacheTimestamps[deviceId] = DateTime.UtcNow;
@@ -67,7 +75,6 @@ public class CacheService : IEventHandler<CustomerLoadedEvent>, IDisposable
             _logger.LogError(ex, "[CacheService]: Error while warming cache for customer {CustomerId}", customerId);
         }
 
-        // Publish CacheReadyEvent for this customer
         var cacheReadyEvent = new CacheReadyEvent(
             customerId: customerId,
             source: nameof(CacheService),
@@ -94,14 +101,12 @@ public class CacheService : IEventHandler<CustomerLoadedEvent>, IDisposable
     {
         _deviceToCustomerCache[deviceId] = customer;
         _deviceCacheTimestamps[deviceId] = DateTime.UtcNow;
-        _logger.LogDebug("[CacheService]: Cached customer for device {DeviceId}", deviceId);
     }
 
     public void RemoveDevice(string deviceId)
     {
         _deviceToCustomerCache.TryRemove(deviceId, out _);
         _deviceCacheTimestamps.TryRemove(deviceId, out _);
-        _logger.LogDebug("[CacheService]: Removed device {DeviceId} from cache", deviceId);
     }
 
     public bool ContainsDevice(string deviceId)
@@ -125,7 +130,6 @@ public class CacheService : IEventHandler<CustomerLoadedEvent>, IDisposable
     {
         _deviceToCustomerCache.Clear();
         _deviceCacheTimestamps.Clear();
-        _logger.LogInformation("[CacheService]: Cache cleared");
     }
 
     public CacheStatistics GetStatistics()
@@ -156,8 +160,6 @@ public class CacheService : IEventHandler<CustomerLoadedEvent>, IDisposable
             TimeSpan.FromMinutes(5),
             TimeSpan.FromMinutes(5)
         );
-
-        _logger.LogDebug("[CacheService]: Cache cleanup timer started");
     }
 
     private void CleanupExpiredEntries()
@@ -173,11 +175,6 @@ public class CacheService : IEventHandler<CustomerLoadedEvent>, IDisposable
                 _deviceToCustomerCache.TryRemove(key, out _);
                 _deviceCacheTimestamps.TryRemove(key, out _);
             }
-
-            if (expiredKeys.Count > 0)
-            {
-                _logger.LogDebug("[CacheService]: Cleaned up {Count} expired cache entries", expiredKeys.Count);
-            }
         }
         catch (Exception ex)
         {
@@ -188,7 +185,6 @@ public class CacheService : IEventHandler<CustomerLoadedEvent>, IDisposable
     public void Dispose()
     {
         _cleanupTimer?.Dispose();
-        _logger.LogInformation("[CacheService]: Disposed");
     }
 }
 
